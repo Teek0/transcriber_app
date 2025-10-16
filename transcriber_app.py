@@ -243,6 +243,21 @@ class App(tk.Tk):
         self.geometry("760x600")
         self.minsize(720, 560)
 
+        # === Ícono personalizado ===
+        def _resource_path(*parts):
+            if getattr(sys, "frozen", False):
+                base = Path(sys.executable).parent
+            else:
+                base = Path(__file__).parent
+            return base.joinpath(*parts)
+
+        icon_path = _resource_path("assets", "lumi.ico")
+        try:
+            self.iconbitmap(str(icon_path))
+        except Exception as e:
+            print(f"No se pudo cargar el ícono: {e}")
+        # ============================
+
         self.log_q: "queue.Queue[str]" = queue.Queue()
         self.worker: Optional[threading.Thread] = None
         self.stop_flag = threading.Event()  # reservado por si se añade cancelación real
@@ -477,7 +492,6 @@ class App(tk.Tk):
                 subprocess.run(["xdg-open", folder])
         except Exception as e:
             messagebox.showerror("Error", f"No se pudo abrir la carpeta:\n{e}")
-
 
 if __name__ == "__main__":
     App().mainloop()
