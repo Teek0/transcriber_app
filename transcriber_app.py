@@ -1,66 +1,71 @@
 """
-Lumi Transcriber GUI — Tkinter + Faster-Whisper (solo TXT, con progreso real)
+Lumi Transcriber GUI — Tkinter + faster-whisper (refactor legible)
 
-Cambios clave respecto a la versión anterior:
-  • Cambiado a faster-whisper para recibir segmentos en streaming.
-  • Progreso real por archivo: la barra refleja % = (seg.end / duración) * 100.
-  • Carpeta: la barra muestra el progreso del archivo en curso (y el texto de estado indica i/N).
-  • Arreglo del log: garantiza salto de línea.
+Objetivo de este refactor:
+  • Separar responsabilidades (utilidades, modelo, transcripción, GUI).
+  • Nombres consistentes y tipos explícitos.
+  • Docstrings y comentarios breves.
+  • Corregir detalle: uso coherente del parámetro `language` al llamar a `model.transcribe`.
+  • Mantener comportamiento existente: progreso por tiempo y guardado .txt.
 
-Requisitos (para ejecutar desde código):
+Requisitos:
   - Python 3.9+
   - pip install faster-whisper
-  - (opcional) pip install torch  # si quieres usar GPU, faster-whisper puede aprovecharla
-  - FFmpeg disponible en PATH (ffmpeg/ffprobe)
-
-Build (ejecutable):
-  - pip install pyinstaller
-  - pyinstaller --name "LumiTranscriber" --onefile --noconsole main_gui.py
-
-Autor: Lumi.
+  - (opcional) pip install torch
+  - FFmpeg en PATH (ffmpeg/ffprobe)
 """
+from __future__ import annotations
 
-import os, sys
-from pathlib import Path
-
-# --- Configuración de HuggingFace para evitar symlinks ---
-os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
-os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
-os.environ.setdefault("HF_HOME", str(Path.home() / ".cache" / "hf_lumi"))
-
-# Si está congelado por PyInstaller, redirige HF_HOME a una carpeta junto al .exe
-if getattr(sys, "frozen", False):
-    exe_dir = Path(sys.executable).parent
-    os.environ.setdefault("HF_HOME", str(exe_dir / "models_cache"))
-# ---------------------------------------------------------
-
-import threading
-import queue
+import os
+import sys
 import json
-import subprocess
+import queue
 import shutil
+import threading
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Optional
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-# -------------------- Dependencias --------------------
+# ==========================
+#   Configuración global
+# ==========================
+# Evitar symlinks (Windows) y fijar caché de HF
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS", "1")
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+os.environ.setdefault("HF_HOME", str(Path.home() / ".cache" / "hf_lumi"))
+
+# Si es binario PyInstaller, usar caché junto al ejecutable
+if getattr(sys, "frozen", False):
+    exe_dir = Path(sys.executable).parent
+    os.environ.setdefault("HF_HOME", str(exe_dir / "models_cache"))
+
 try:
     from faster_whisper import WhisperModel
-except Exception as e:
+except Exception:
     WhisperModel = None  # type: ignore
 
+# ==========================
+#   Constantes y mapas
+# ==========================
 VALID_EXTENSIONS = {".mkv", ".mp4", ".mp3", ".wav", ".flac", ".webm", ".m4a"}
-DEFAULT_MODEL = "medium"  # tiny, base, small, medium, large-v2 (si está disponible en tu instalación)
-LANG_MAP = {"Spanish":"es","English":"en","Portuguese":"pt","French":"fr","German":"de","Italian":"it"}
+DEFAULT_MODEL = "medium"  # tiny, base, small, medium, large-v2 (si disponible)
+LANG_MAP = {"Spanish": "es", "English": "en", "Portuguese": "pt", "French": "fr", "Italian": "it"}
 LANGUAGES = ["auto"] + list(LANG_MAP.keys())
 
-# -------------------- Utilidades --------------------
+# ==========================
+#   Utilidades de sistema
+# ==========================
 
-def which(program: str) -> str | None:
+def which(program: str) -> Optional[str]:
+    """Versión portable de `which`.
+    Devuelve ruta ejecutable o None.
+    """
     paths = os.environ.get("PATH", "").split(os.pathsep)
-    exts = [""]
-    if os.name == "nt":
-        exts = os.environ.get("PATHEXT", ".EXE;.BAT;.CMD").split(";")
+    exts = os.environ.get("PATHEXT", ".EXE;.BAT;.CMD").split(";") if os.name == "nt" else [""]
     for p in paths:
         full = Path(p) / program
         for ext in exts:
@@ -71,6 +76,7 @@ def which(program: str) -> str | None:
 
 
 def check_ffmpeg() -> tuple[bool, str]:
+    """Comprueba presencia de ffmpeg y ffprobe en PATH."""
     ffmpeg_path = which("ffmpeg")
     ffprobe_path = which("ffprobe")
     if not ffmpeg_path or not ffprobe_path:
@@ -82,11 +88,18 @@ def check_ffmpeg() -> tuple[bool, str]:
         return False, f"No pude ejecutar ffmpeg: {e}"
 
 
-def get_duration_seconds(path: str) -> float | None:
+def get_duration_seconds(path: Path) -> Optional[float]:
+    """Obtiene duración (segundos) usando ffprobe. None si falla."""
     try:
         cmd = [
-            "ffprobe", "-v", "error", "-print_format", "json",
-            "-show_entries", "format=duration", path
+            "ffprobe",
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_entries",
+            "format=duration",
+            str(path),
         ]
         out = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
         data = json.loads(out.decode("utf-8", errors="ignore"))
@@ -95,83 +108,114 @@ def get_duration_seconds(path: str) -> float | None:
         return None
 
 
-# -------------------- Escritor --------------------
-
 def write_txt(out_path: Path, text: str) -> None:
     out_path.write_text(text, encoding="utf-8")
 
+# ==========================
+#   Modelo y transcripción
+# ==========================
 
-# -------------------- Lógica de transcripción (faster-whisper) --------------------
+@dataclass
+class ModelSpec:
+    name: str = DEFAULT_MODEL
+    compute_type: str = "float32"  # puedes cambiar a int8/float16 según HW
 
-def load_model(name: str, log: queue.Queue):
-    if WhisperModel is None:
-        raise RuntimeError("'faster-whisper' no está instalado. Ejecuta: pip install faster-whisper")
 
-    cache_root = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "hf_lumi"))
-    model_cache = cache_root / "hub" / f"models--Systran--faster-whisper-{name}"
-    log.put(f"Cargando modelo: {name}… (primera vez puede tardar)\n")
+class Transcriber:
+    """Facade simple sobre faster-whisper para un único proceso de transcripción."""
 
-    for attempt in range(2):  # un intento de recuperación máximo
-        try:
-            model = WhisperModel(name, compute_type="float32")
-            log.put("✅ Modelo cargado correctamente.\n")
-            return model
-        except Exception as e:
-            msg = str(e)
-            if "WinError 1314" in msg and attempt == 0:
-                log.put("⚠️ Se detectó error de permisos (WinError 1314). Limpiando caché y reintentando…\n")
-                try:
-                    if model_cache.exists():
-                        shutil.rmtree(model_cache)
-                        log.put(f"🧹 Caché borrado: {model_cache}\n")
-                except Exception as ex:
-                    log.put(f"❌ No pude borrar el caché: {ex}\n")
-                continue  # intentar cargar nuevamente
-            else:
+    def __init__(self, spec: ModelSpec, log_q: "queue.Queue[str]") -> None:
+        self.spec = spec
+        self.log_q = log_q
+        self._model = None
+
+    @property
+    def model(self):
+        if self._model is None:
+            self._model = self._load_model()
+        return self._model
+
+    def _load_model(self):
+        if WhisperModel is None:
+            raise RuntimeError("'faster-whisper' no está instalado. Ejecuta: pip install faster-whisper")
+
+        cache_root = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "hf_lumi"))
+        model_cache = cache_root / "hub" / f"models--Systran--faster-whisper-{self.spec.name}"
+
+        self._log(f"Cargando modelo: {self.spec.name}… (primera vez puede tardar)")
+        for attempt in range(2):
+            try:
+                m = WhisperModel(self.spec.name, compute_type=self.spec.compute_type)
+                self._log("✅ Modelo cargado correctamente.")
+                return m
+            except Exception as e:
+                msg = str(e)
+                if "WinError 1314" in msg and attempt == 0:
+                    self._log("⚠️ Permisos insuficientes (WinError 1314). Limpiando caché y reintentando…")
+                    try:
+                        if model_cache.exists():
+                            shutil.rmtree(model_cache)
+                            self._log(f"🧹 Caché borrado: {model_cache}")
+                    except Exception as ex:
+                        self._log(f"❌ No pude borrar el caché: {ex}")
+                    continue
                 raise
 
+    # ---- API pública ----
+    def transcribe(
+        self,
+        media_path: Path,
+        language_ui: str,
+        on_progress: Callable[[float], None],
+    ) -> None:
+        """Transcribe `media_path` y guarda .txt al lado.
+        `language_ui` puede ser 'auto' o una etiqueta UI (p.ej. 'Spanish').
+        `on_progress` recibe 0..100.
+        """
+        self._log(f"🎧 Transcribiendo: {media_path.name}")
+        dur = get_duration_seconds(media_path)
+        if dur:
+            self._log(f"🎬 Duración estimada: ~{int(round(dur/60))} min ({int(dur)} s)")
+        else:
+            self._log("⚠️ No pude estimar duración con ffprobe.")
 
+        # Normalizar idioma para la API
+        lang: Optional[str]
+        if language_ui == "auto":
+            lang = None
+        else:
+            lang = LANG_MAP.get(language_ui) or language_ui  # acepta código ya normalizado
 
-def transcribe_file(model, path: Path, language: str, on_progress, log: queue.Queue) -> None:
-    """
-    Transcribe un archivo y actualiza la barra con progreso real por tiempo.
-    on_progress: callback que recibe un float [0..100].
-    """
-    log.put(f"🎧 Transcribiendo: {path.name}")
-    dur = get_duration_seconds(str(path))
-    if dur:
-        log.put(f"🎬 Duración estimada: ~{int(round(dur/60))} min ({int(dur)} s)")
-    else:
-        log.put("⚠️ No pude estimar duración con ffprobe.")
+        # Importante: usar `lang` para la llamada a faster-whisper
+        segments, _info = self.model.transcribe(str(media_path), language=lang)
 
-    lang = None if language == "auto" else language
+        parts: list[str] = []
+        last_end = 0.0
+        for seg in segments:
+            text_piece = (seg.text or "").strip()
+            if text_piece:
+                parts.append(text_piece)
+            # progreso por tiempo
+            end = float(getattr(seg, "end", 0.0) or last_end)
+            last_end = end
+            if dur and dur > 0:
+                pct = max(0.0, min(100.0, end / dur * 100.0))
+                on_progress(pct)
 
-    # Generador de segmentos
-    segments, _info = model.transcribe(str(path), language=language)
+        text = " ".join(parts).strip()
+        out_txt = media_path.with_suffix(".txt")
+        write_txt(out_txt, text)
+        self._log("📄 Guardado TXT.")
+        self._log("✅ Transcripción completada.")
 
-    parts: list[str] = []
-    last_end = 0.0
-    for seg in segments:
-        # seg.text incluye espacio inicial a veces; lo normalizamos
-        text_piece = (seg.text or "").strip()
-        if text_piece:
-            parts.append(text_piece)
-        # progreso por tiempo
-        end = float(seg.end or last_end)
-        last_end = end
-        if dur and dur > 0:
-            pct = max(0.0, min(100.0, end / dur * 100.0))
-            on_progress(pct)
+    # ---- util interno ----
+    def _log(self, msg: str) -> None:
+        self.log_q.put(msg)
 
-    # Guardar
-    text = " ".join(parts).strip()
-    out_base = path.with_suffix("")
-    write_txt(out_base.with_suffix(".txt"), text)
-    log.put("📄 Guardado TXT.")
-    log.put("✅ Transcripción completada.")
+# ==========================
+#   GUI (Tkinter)
+# ==========================
 
-
-# -------------------- GUI --------------------
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -179,21 +223,18 @@ class App(tk.Tk):
         self.geometry("760x600")
         self.minsize(720, 560)
 
-        self.log_q: queue.Queue[str] = queue.Queue()
-        self.worker: threading.Thread | None = None
-        self.stop_flag = threading.Event()
+        self.log_q: "queue.Queue[str]" = queue.Queue()
+        self.worker: Optional[threading.Thread] = None
+        self.stop_flag = threading.Event()  # reservado por si se añade cancelación real
 
-        self.create_widgets()
+        self._build_widgets()
         self.after(100, self._drain_log)
 
         ok, msg = check_ffmpeg()
-        if ok:
-            self._log(f"✅ FFmpeg detectado: {msg}")
-        else:
-            self._log(f"⚠️ {msg}")
-
+        self._log(f"✅ FFmpeg detectado: {msg}" if ok else f"⚠️ {msg}")
         self._update_start_enabled()
 
+    # ---------- Infra de log ----------
     def _log(self, text: str) -> None:
         self.log_q.put(text)
 
@@ -209,72 +250,68 @@ class App(tk.Tk):
             pass
         self.after(100, self._drain_log)
 
-    # ---- UI layout ----
-    def create_widgets(self) -> None:
+    # ---------- UI ----------
+    def _build_widgets(self) -> None:
         pad = {"padx": 10, "pady": 8}
 
-        frm_top = ttk.Frame(self)
-        frm_top.pack(fill="x", **pad)
-
+        top = ttk.Frame(self)
+        top.pack(fill="x", **pad)
         self.mode = tk.StringVar(value="file")
-        r1 = ttk.Radiobutton(frm_top, text="Transcribir archivo", variable=self.mode, value="file", command=self._update_start_enabled)
-        r2 = ttk.Radiobutton(frm_top, text="Transcribir carpeta", variable=self.mode, value="folder", command=self._update_start_enabled)
-        r1.grid(row=0, column=0, sticky="w")
-        r2.grid(row=0, column=1, sticky="w")
+        ttk.Radiobutton(top, text="Transcribir archivo", variable=self.mode, value="file", command=self._update_start_enabled).grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(top, text="Transcribir carpeta", variable=self.mode, value="folder", command=self._update_start_enabled).grid(row=0, column=1, sticky="w")
 
         self.path_var = tk.StringVar()
-        self.path_var.trace_add("write", lambda *args: self._update_start_enabled())
-        btn_browse = ttk.Button(frm_top, text="Elegir…", command=self.browse_path)
-        ent_path = ttk.Entry(frm_top, textvariable=self.path_var)
-        ent_path.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(4,0))
-        btn_browse.grid(row=1, column=3, sticky="e", padx=(6,0), pady=(4,0))
-        frm_top.columnconfigure(2, weight=1)
+        self.path_var.trace_add("write", lambda *_: self._update_start_enabled())
+        ttk.Entry(top, textvariable=self.path_var).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        ttk.Button(top, text="Elegir…", command=self._browse_path).grid(row=1, column=3, sticky="e", padx=(6, 0), pady=(4, 0))
+        top.columnconfigure(2, weight=1)
 
-        frm_opts = ttk.LabelFrame(self, text="Opciones")
-        frm_opts.pack(fill="x", **pad)
-
-        ttk.Label(frm_opts, text="Modelo").grid(row=0, column=0, sticky="w")
-        self.cmb_model = ttk.Combobox(frm_opts, state="readonly", values=["tiny","base","small","medium","large"])
+        opts = ttk.LabelFrame(self, text="Opciones")
+        opts.pack(fill="x", **pad)
+        ttk.Label(opts, text="Modelo").grid(row=0, column=0, sticky="w")
+        self.cmb_model = ttk.Combobox(opts, state="readonly", values=["tiny", "base", "small", "medium", "large"])
         self.cmb_model.set(DEFAULT_MODEL)
         self.cmb_model.grid(row=0, column=1, sticky="w")
 
-        ttk.Label(frm_opts, text="Idioma").grid(row=0, column=2, sticky="w", padx=(12,0))
-        self.cmb_lang = ttk.Combobox(frm_opts, state="readonly", values=LANGUAGES)
+        ttk.Label(opts, text="Idioma").grid(row=0, column=2, sticky="w", padx=(12, 0))
+        self.cmb_lang = ttk.Combobox(opts, state="readonly", values=LANGUAGES)
         self.cmb_lang.set("Spanish")
         self.cmb_lang.grid(row=0, column=3, sticky="w")
 
         ttk.Label(
-            frm_opts,
-            text="* Si se selecciona un idioma distinto al original, se hace una traducción automática al idioma elegido.",
-            foreground="#555",  # gris suave
-            wraplength=680,     # evita que se salga del frame
-            justify="left"
-        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(6,0))
+            opts,
+            text="* Si seleccionas un idioma distinto al original, se traducirá automáticamente al idioma elegido.",
+            foreground="#555",
+            wraplength=680,
+            justify="left",
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
-        frm_actions = ttk.Frame(self)
-        frm_actions.pack(fill="x", **pad)
-        self.btn_start = ttk.Button(frm_actions, text="Iniciar", command=self.start, state="disabled")
+        actions = ttk.Frame(self)
+        actions.pack(fill="x", **pad)
+        self.btn_start = ttk.Button(actions, text="Iniciar", command=self.start, state="disabled")
         self.btn_start.pack(side="left")
-        self.btn_stop = ttk.Button(frm_actions, text="Detener", command=self.stop, state="disabled")
-        self.btn_stop.pack(side="left", padx=(8,0))
+        self.btn_stop = ttk.Button(actions, text="Detener", command=self.stop, state="disabled")
+        self.btn_stop.pack(side="left", padx=(8, 0))
 
-        frm_log = ttk.LabelFrame(self, text="Registro")
-        frm_log.pack(fill="both", expand=True, **pad)
-        self.txt_log = tk.Text(frm_log, wrap="word", height=16, state="disabled")
+        logf = ttk.LabelFrame(self, text="Registro")
+        logf.pack(fill="both", expand=True, **pad)
+        self.txt_log = tk.Text(logf, wrap="word", height=16, state="disabled")
         self.txt_log.pack(fill="both", expand=True)
 
-        # ---- Barra de progreso inferior (determinada para todo) ----
-        frm_status = ttk.Frame(self)
-        frm_status.pack(fill="x", padx=10, pady=(0,10))
-        self.progress = ttk.Progressbar(frm_status, mode="determinate", maximum=100)
+        status = ttk.Frame(self)
+        status.pack(fill="x", padx=10, pady=(0, 10))
+        self.progress = ttk.Progressbar(status, mode="determinate", maximum=100)
         self.progress.pack(fill="x", side="left", expand=True)
-        self.lbl_status = ttk.Label(frm_status, text="Listo")
-        self.lbl_status.pack(side="left", padx=(10,0))
+        self.lbl_status = ttk.Label(status, text="Listo")
+        self.lbl_status.pack(side="left", padx=(10, 0))
 
-    def browse_path(self) -> None:
+    # ---------- Helpers de UI ----------
+    def _browse_path(self) -> None:
         if self.mode.get() == "file":
-            path = filedialog.askopenfilename(title="Selecciona un archivo de audio/video",
-                                              filetypes=[("Medios", "*.mkv *.mp4 *.mp3 *.wav *.flac *.webm *.m4a")])
+            path = filedialog.askopenfilename(
+                title="Selecciona un archivo de audio/video",
+                filetypes=[("Medios", "*.mkv *.mp4 *.mp3 *.wav *.flac *.webm *.m4a")],
+            )
         else:
             path = filedialog.askdirectory(title="Selecciona una carpeta")
         if path:
@@ -287,105 +324,95 @@ class App(tk.Tk):
         p = Path(path)
         if self.mode.get() == "file":
             return p.is_file() and p.suffix.lower() in VALID_EXTENSIONS
-        else:
-            return p.is_dir()
+        return p.is_dir()
 
     def _update_start_enabled(self) -> None:
-        self.btn_start.configure(state="normal" if self._valid_selection() and not self.worker else "disabled")
+        enabled = self._valid_selection() and not self.worker
+        self.btn_start.configure(state="normal" if enabled else "disabled")
 
-    def set_running(self, running: bool) -> None:
+    def _set_running(self, running: bool) -> None:
         self.btn_start.configure(state="disabled" if running else ("normal" if self._valid_selection() else "disabled"))
         self.btn_stop.configure(state="normal" if running else "disabled")
 
     # ---------- Progreso visual ----------
-    def _progress_reset(self):
+    def _progress_reset(self) -> None:
         self.progress.stop()
         self.progress.configure(mode="determinate", maximum=100, value=0)
         self.lbl_status.configure(text="Listo")
 
-    def _progress_set(self, value: float, text: str):
+    def _progress_set(self, value: float, text: str) -> None:
         self.progress.configure(mode="determinate")
         self.progress.stop()
         self.progress["value"] = max(0, min(100, value))
         self.lbl_status.configure(text=text)
 
-    def _progress_busy(self, text="Cargando…"):
-        # Barra animada (indeterminada) con texto
+    def _progress_busy(self, text: str = "Cargando…") -> None:
         self.progress.configure(mode="indeterminate")
-        self.progress.start(12)  # velocidad del “marquee”
+        self.progress.start(12)
         self.lbl_status.configure(text=text)
 
-    def _progress_to_determinate(self, text="Procesando…"):
-        # Volver a barra real (determinada)
+    def _progress_to_determinate(self, text: str = "Procesando…") -> None:
         self.progress.stop()
         self.progress.configure(mode="determinate", maximum=100, value=0)
         self.lbl_status.configure(text=text)
 
+    # ---------- Acciones ----------
     def start(self) -> None:
-        path = self.path_var.get().strip()
         if not self._valid_selection():
             messagebox.showwarning("Falta ruta", "Elige un archivo compatible o una carpeta válida.")
             return
 
         model_name = self.cmb_model.get()
-        lang_label = self.cmb_lang.get()
-        lang = None if lang_label == "auto" else LANG_MAP.get(lang_label, None)
+        language_ui = self.cmb_lang.get()
+        path = Path(self.path_var.get().strip())
 
         self.stop_flag.clear()
-        self.set_running(True)
+        self._set_running(True)
 
-        def worker():
+        def worker() -> None:
             try:
                 self.after(0, lambda: self._progress_busy("Cargando modelo…"))
-                model = load_model(model_name, self.log_q)
-                p = Path(path)
+                transcriber = Transcriber(ModelSpec(name=model_name), self.log_q)
 
-                if p.is_file():
-                    # Progreso real por segmentos
+                if path.is_file():
                     self._log("Iniciando transcripción…\n")
 
-                    switched = {"done": False}  # banderita para cambiar una sola vez
+                    switched = {"done": False}
 
-                    def onp(v):
+                    def onp(v: float) -> None:
                         if not switched["done"]:
                             switched["done"] = True
-                            # Cuando llegan los primeros segmentos: pasar a barra determinada
                             self.after(0, lambda: self._progress_to_determinate("Procesando…"))
                         self.after(0, lambda: self._progress_set(v, f"Procesando {v:.0f}%…"))
 
-                    transcribe_file(model, p, lang, onp, self.log_q)
+                    transcriber.transcribe(path, language_ui, onp)
                     self._progress_set(100, "Completado")
                 else:
-                    files = sorted([x for x in p.iterdir() if x.is_file() and x.suffix.lower() in VALID_EXTENSIONS])
+                    files = sorted([x for x in path.iterdir() if x.is_file() and x.suffix.lower() in VALID_EXTENSIONS])
                     self.after(0, lambda: self._progress_busy("Preparando…"))
                     total = len(files)
                     if not files:
                         self._log("No hay medios compatibles en la carpeta.\n")
-                    for i, f in enumerate(files, start=1):
+                    for i, media in enumerate(files, start=1):
                         if self.stop_flag.is_set():
                             self._log("⏹️ Proceso detenido por el usuario.\n")
                             break
 
-                        self._log(f"[{i}/{total}] -> {f.name}\n")
-
-                        # mostrar “cargando” hasta que lleguen los primeros segmentos
+                        self._log(f"[{i}/{total}] -> {media.name}\n")
                         self.after(0, lambda i=i, total=total: self._progress_busy(f"Preparando {i}/{total}…"))
 
-                        switched = {"done": False}  # bandera por archivo
+                        switched = {"done": False}
 
-                        def onp(v, i=i, total=total):
-                            # la primera vez que llega un segmento, pasamos a barra determinada
+                        def onp(v: float, i=i, total=total) -> None:
                             if not switched["done"]:
                                 switched["done"] = True
                                 self.after(0, lambda i=i, total=total: self._progress_to_determinate(f"Procesando {i}/{total}…"))
                             self.after(0, lambda v=v, i=i, total=total: self._progress_set(v, f"Procesando {i}/{total} — {v:.0f}%"))
 
-                        transcribe_file(model, f, lang, onp, self.log_q)
+                        transcriber.transcribe(media, language_ui, onp)
                         self._progress_set(100, f"Procesando {i}/{total} — 100%")
-
-                        # si quedan archivos, vuelve a “Preparando…” para que se note el cambio
                         if i < total:
-                            self.after(0, lambda i=i+1, total=total: self._progress_busy(f"Preparando {i}/{total}…"))
+                            self.after(0, lambda i=i + 1, total=total: self._progress_busy(f"Preparando {i}/{total}…"))
 
                     if total:
                         self._progress_set(100, "Completado")
@@ -393,7 +420,7 @@ class App(tk.Tk):
             except Exception as e:
                 self._log(f"💥 Error: {e}")
             finally:
-                self.set_running(False)
+                self._set_running(False)
                 self.worker = None
                 self.after(500, self._progress_reset)
                 self.after(0, self._update_start_enabled)
@@ -408,5 +435,4 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()
+    App().mainloop()
