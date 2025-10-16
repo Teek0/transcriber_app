@@ -397,11 +397,11 @@ class App(tk.Tk):
                 self.after(0, lambda: self._progress_busy("Cargando modelo…"))
                 transcriber = Transcriber(ModelSpec(name=model_name), self.log_q)
 
+                _ = transcriber.model
+
                 if path.is_file():
                     self._log("Iniciando transcripción…\n")
-
                     switched = {"done": False}
-
                     def onp(v: float) -> None:
                         if not switched["done"]:
                             switched["done"] = True
@@ -425,7 +425,6 @@ class App(tk.Tk):
                         self.after(0, lambda i=i, total=total: self._progress_busy(f"Preparando {i}/{total}…"))
 
                         switched = {"done": False}
-
                         def onp(v: float, i=i, total=total) -> None:
                             if not switched["done"]:
                                 switched["done"] = True
