@@ -203,9 +203,29 @@ class Transcriber:
                 on_progress(pct)
 
         text = " ".join(parts).strip()
-        out_txt = media_path.with_suffix(".txt")
+
+        try:
+            detected_lang = (_info.language if language_ui == "auto" else None)
+        except Exception:
+            detected_lang = None
+
+        if language_ui == "auto":
+            lang_code = (detected_lang or "auto")
+        else:
+            lang_code = LANG_MAP.get(language_ui) or language_ui
+
+        def _safe(s: str) -> str:
+            return "".join(ch if ch.isalnum() or ch in ("-", "_", " ") else "_" for ch in s).strip()
+
+        stem = _safe(media_path.stem)
+        lang_code = _safe(lang_code.lower())
+        model_name = _safe(self.spec.name.lower())
+
+        out_name = f"{stem}_{lang_code}_{model_name}.txt"
+        out_txt = media_path.parent / out_name
+
         write_txt(out_txt, text)
-        self._log("📄 Guardado TXT.")
+        self._log(f"📄 Guardado TXT: {out_txt.name}")
         self._log("✅ Transcripción completada.")
 
     # ---- util interno ----
@@ -265,6 +285,9 @@ class App(tk.Tk):
         ttk.Entry(top, textvariable=self.path_var).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(4, 0))
         ttk.Button(top, text="Elegir…", command=self._browse_path).grid(row=1, column=3, sticky="e", padx=(6, 0), pady=(4, 0))
         top.columnconfigure(2, weight=1)
+        
+        ttk.Button(top, text="Abrir carpeta", command=self._open_folder).grid(row=1, column=4, sticky="e", padx=(6, 0), pady=(4, 0))
+
 
         opts = ttk.LabelFrame(self, text="Opciones")
         opts.pack(fill="x", **pad)
@@ -432,6 +455,29 @@ class App(tk.Tk):
     def stop(self) -> None:
         self.stop_flag.set()
         self._log("Solicitando detener… espera a que finalice el archivo en curso.")
+
+    def _open_folder(self) -> None:
+        """Abre la carpeta del archivo o la carpeta seleccionada."""
+        path_str = self.path_var.get().strip()
+        if not path_str:
+            messagebox.showinfo("Sin selección", "Primero elige un archivo o una carpeta.")
+            return
+
+        p = Path(path_str)
+        folder = p.parent if p.is_file() else p
+        if not folder.exists():
+            messagebox.showerror("Error", f"La carpeta no existe:\n{folder}")
+            return
+
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(folder)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.run(["open", folder])
+            else:
+                subprocess.run(["xdg-open", folder])
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo abrir la carpeta:\n{e}")
 
 
 if __name__ == "__main__":
