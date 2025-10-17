@@ -345,6 +345,8 @@ class App(tk.Tk):
 
         self._build_widgets()
 
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
         ensure_ffmpeg_available(interactive=True)
 
         ok, msg = check_ffmpeg()
@@ -353,6 +355,15 @@ class App(tk.Tk):
         self.after(100, self._drain_log)
         self._update_start_enabled()
 
+    def _on_close(self) -> None:
+        """Cierra la app garantizando que los hilos se detengan."""
+        self.stop_flag.set()
+        if self.worker and self.worker.is_alive():
+            # Intentar una espera breve para que el hilo termine limpio.
+            self.worker.join(timeout=1)
+        self.quit()
+        self.destroy()
+        
     # ---------- Infra de log ----------
     def _log(self, text: str) -> None:
         self.log_q.put(text)
