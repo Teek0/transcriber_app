@@ -36,6 +36,7 @@ from tkinter import ttk, filedialog, messagebox
 # Evitar symlinks (Windows) y fijar caché de HF
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS", "1")
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+os.environ.setdefault("HF_HUB_DISABLE_HARD_LINKS", "1")
 os.environ.setdefault("HF_HOME", str(Path.home() / ".cache" / "hf_lumi"))
 
 # Si es binario PyInstaller, usar caché junto al ejecutable
@@ -47,6 +48,11 @@ try:
     from faster_whisper import WhisperModel
 except Exception:
     WhisperModel = None  # type: ignore
+
+try:
+    from huggingface_hub import snapshot_download
+except Exception:
+    snapshot_download = None  # type: ignore
 
 # --- FFMPEG discovery/forcing (plug-and-play) ---
 FFMPEG_EXE = None  # type: Optional[Path]
@@ -126,7 +132,7 @@ def ensure_ffmpeg_available(interactive: bool = True) -> None:
 #   Constantes y mapas
 # ==========================
 VALID_EXTENSIONS = {".mkv", ".mp4", ".mp3", ".wav", ".flac", ".webm", ".m4a"}
-DEFAULT_MODEL = "small"  # tiny, base, small, medium, large-v3 (si disponible)
+DEFAULT_MODEL = "base"  # tiny, base, small, medium, large-v3 (si disponible)
 LANG_MAP = {"Spanish": "es", "English": "en", "Portuguese": "pt", "French": "fr", "Italian": "it"}
 LANGUAGES = ["auto"] + list(LANG_MAP.keys())
 
@@ -216,31 +222,99 @@ class Transcriber:
             self._model = self._load_model()
         return self._model
 
+    def _cleanup_partial_downloads(self, model_cache: Path) -> None:
+        """Remove stale lock/incomplete files to avoid stalled retries."""
+        if not model_cache.exists():
+            return
+
+        removed = 0
+        for pattern in ("**/*.lock", "**/*.incomplete"):
+            for item in model_cache.glob(pattern):
+                try:
+                    if item.is_file():
+                        item.unlink()
+                        removed += 1
+                except Exception:
+                    continue
+
+        if removed:
+            self._log(f"🧹 Limpieza de descargas incompletas ({removed} archivos).")
+
     def _load_model(self):
         if WhisperModel is None:
             raise RuntimeError("'faster-whisper' no está instalado. Ejecuta: pip install faster-whisper")
 
-        cache_root = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "hf_lumi"))
-        model_cache = cache_root / "hub" / f"models--Systran--faster-whisper-{self.spec.name}"
-
         self._log(f"Cargando modelo: {self.spec.name}… (primera vez puede tardar)")
-        for attempt in range(2):
+        repo_id = f"Systran/faster-whisper-{self.spec.name}"
+
+        default_cache = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "hf_lumi"))
+        user_cache = Path.home() / ".cache" / "hf_lumi"
+
+        cache_candidates: list[Path] = []
+        seen = set()
+        for candidate in (default_cache, user_cache):
+            if str(candidate) not in seen:
+                seen.add(str(candidate))
+                cache_candidates.append(candidate)
+
+        last_error: Optional[Exception] = None
+
+        for idx, cache_root in enumerate(cache_candidates):
+            os.environ["HF_HOME"] = str(cache_root)
+            model_cache = cache_root / "hub" / f"models--Systran--faster-whisper-{self.spec.name}"
+
             try:
+                cache_root.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                last_error = exc
+                self._log(f"❌ No pude crear la carpeta de caché {cache_root}: {exc}")
+                continue
+
+            if idx > 0:
+                self._log(f"🔁 Intentando usar caché alternativo: {cache_root}")
+
+            # Limpiar descargas previas que hayan quedado a medias.
+            self._cleanup_partial_downloads(model_cache)
+
+            try:
+                if snapshot_download is not None:
+                    snapshot_download(
+                        repo_id,
+                        cache_dir=cache_root,
+                        resume_download=True,
+                        local_dir=None,
+                        local_dir_use_symlinks=False,
+                    )
+
                 m = WhisperModel(self.spec.name, compute_type=self.spec.compute_type)
                 self._log("✅ Modelo cargado correctamente.")
                 return m
             except Exception as e:
+                last_error = e
                 msg = str(e)
-                if "WinError 1314" in msg and attempt == 0:
-                    self._log("⚠️ Permisos insuficientes (WinError 1314). Limpiando caché y reintentando…")
+                permission_tokens = ("WinError 5", "WinError 1314", "Access is denied", "Permiso denegado")
+                permission_issue = any(token in msg for token in permission_tokens)
+
+                if permission_issue and idx < len(cache_candidates) - 1:
+                    self._log(
+                        "⚠️ No tengo permisos para escribir en la carpeta de caché actual. Intentando otra ubicación…"
+                    )
+                    continue
+
+                if "WinError 1314" in msg:
                     try:
                         if model_cache.exists():
                             shutil.rmtree(model_cache)
-                            self._log(f"🧹 Caché borrado: {model_cache}")
+                            self._log(f"🧹 Caché borrado tras error de privilegios: {model_cache}")
+                        continue
                     except Exception as ex:
                         self._log(f"❌ No pude borrar el caché: {ex}")
-                    continue
+
                 raise
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("No pude inicializar el modelo y no se registró error previo.")
 
     # ---- API pública ----
     def transcribe(
