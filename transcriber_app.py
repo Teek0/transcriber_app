@@ -126,7 +126,7 @@ def ensure_ffmpeg_available(interactive: bool = True) -> None:
 #   Constantes y mapas
 # ==========================
 VALID_EXTENSIONS = {".mkv", ".mp4", ".mp3", ".wav", ".flac", ".webm", ".m4a"}
-DEFAULT_MODEL = "medium"  # tiny, base, small, medium, large-v2 (si disponible)
+DEFAULT_MODEL = "small"  # tiny, base, small, medium, large-v3 (si disponible)
 LANG_MAP = {"Spanish": "es", "English": "en", "Portuguese": "pt", "French": "fr", "Italian": "it"}
 LANGUAGES = ["auto"] + list(LANG_MAP.keys())
 
@@ -363,7 +363,7 @@ class App(tk.Tk):
             self.worker.join(timeout=1)
         self.quit()
         self.destroy()
-        
+
     # ---------- Infra de log ----------
     def _log(self, text: str) -> None:
         self.log_q.put(text)
@@ -402,7 +402,7 @@ class App(tk.Tk):
         opts = ttk.LabelFrame(self, text="Opciones")
         opts.pack(fill="x", **pad)
         ttk.Label(opts, text="Modelo").grid(row=0, column=0, sticky="w")
-        self.cmb_model = ttk.Combobox(opts, state="readonly", values=["tiny", "base", "small", "medium", "large"])
+        self.cmb_model = ttk.Combobox(opts, state="readonly", values=["tiny", "base", "small", "medium", "large-v3"])
         self.cmb_model.set(DEFAULT_MODEL)
         self.cmb_model.grid(row=0, column=1, sticky="w")
 
@@ -418,6 +418,21 @@ class App(tk.Tk):
             wraplength=680,
             justify="left",
         ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+        self.btn_download_model = ttk.Button(
+            opts,
+            text="Descargar modelo seleccionado…",
+            command=self._download_model,
+        )
+        self.btn_download_model.grid(row=2, column=0, sticky="w", pady=(10, 0))
+
+        self.btn_manual_install = ttk.Button(
+            opts,
+            text="Instalar modelo manualmente…",
+            command=self._manual_install_model,
+        )
+        self.btn_manual_install.grid(row=2, column=1, sticky="w", padx=(6, 0), pady=(10, 0))
+
 
         actions = ttk.Frame(self)
         actions.pack(fill="x", **pad)
@@ -564,6 +579,170 @@ class App(tk.Tk):
     def stop(self) -> None:
         self.stop_flag.set()
         self._log("Solicitando detener… espera a que finalice el archivo en curso.")
+
+    def _set_auxiliary_buttons_enabled(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        if hasattr(self, "btn_download_model"):
+            self.btn_download_model.configure(state=state)
+        if hasattr(self, "btn_manual_install"):
+            self.btn_manual_install.configure(state=state)
+
+    def _download_model(self) -> None:
+        if self.worker:
+            messagebox.showinfo(
+                "Transcripción en curso",
+                "Espera a que finalice la transcripción antes de descargar modelos.",
+            )
+            return
+
+        model_name = self.cmb_model.get().strip()
+        if not model_name:
+            messagebox.showerror("Error", "Selecciona un modelo antes de descargarlo.")
+            return
+
+        repo_id = f"Systran/faster-whisper-{model_name}"
+        if not messagebox.askyesno(
+            "Descargar modelo",
+            f"¿Deseas descargar el modelo {repo_id}?",
+            icon=messagebox.QUESTION,
+        ):
+            return
+
+        try:
+            from huggingface_hub import snapshot_download
+            try:
+                # la excepción vive en utils (no en el paquete raíz)
+                from huggingface_hub.utils import HfHubHTTPError
+            except Exception:
+                # fallback robusto si cambia el nombre/ruta en versiones futuras
+                class HfHubHTTPError(Exception):
+                    ...
+        except Exception as e:
+            messagebox.showerror(
+                "Dependencia faltante",
+                "No se pudo importar huggingface_hub. Instálalo con:\n"
+                "    pip install --upgrade huggingface_hub\n"
+                f"Detalle: {e}",
+            )
+            self._log(f"❌ No se pudo importar huggingface_hub: {e}")
+            return
+
+
+        cache_dir = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "hf_lumi"))
+
+        def worker() -> None:
+            self._log(f"⬇️ Descargando modelo {repo_id}…")
+            self.after(0, lambda: self._set_auxiliary_buttons_enabled(False))
+            self.after(0, lambda: self._progress_busy(f"Descargando {model_name}…"))
+            try:
+                snapshot_download(
+                    repo_id=repo_id,
+                    cache_dir=str(cache_dir),
+                    resume_download=True,
+                )
+            except HfHubHTTPError as e:  # type: ignore[misc]
+                self._log(f"❌ Error de Hugging Face: {e}")
+                self.after(
+                    0,
+                    lambda: messagebox.showerror(
+                        "Descarga fallida",
+                        "No se pudo descargar el modelo desde Hugging Face.\n"
+                        f"Detalle: {e}",
+                    ),
+                )
+            except Exception as e:
+                self._log(f"❌ Descarga interrumpida: {e}")
+                self.after(
+                    0,
+                    lambda: messagebox.showerror(
+                        "Descarga fallida",
+                        "Ocurrió un error inesperado al descargar el modelo.\n"
+                        f"Detalle: {e}",
+                    ),
+                )
+            else:
+                self._log(f"✅ Modelo descargado correctamente: {repo_id}")
+                self.after(
+                    0,
+                    lambda: messagebox.showinfo(
+                        "Descarga completada",
+                        "El modelo se descargó correctamente y quedará disponible para futuras transcripciones.",
+                    ),
+                )
+            finally:
+                self.after(
+                    0,
+                    lambda: self._progress_reset() if not self.worker else None,
+                )
+                self.after(0, lambda: self._set_auxiliary_buttons_enabled(True))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _manual_install_model(self) -> None:
+        """Permite copiar una carpeta de modelo descargada manualmente al caché local."""
+        try:
+            messagebox.showinfo(
+                "Instalación manual",
+                "Selecciona la carpeta del modelo descargado (models--Systran--faster-whisper-<nombre>).\n"
+                "Puedes copiarla desde otro equipo donde ya se haya bajado.",
+            )
+        except Exception:
+            # En caso de ejecutarse sin entorno gráfico, continuar sin mostrar aviso previo.
+            pass
+
+        chosen = filedialog.askdirectory(title="Selecciona la carpeta del modelo")
+        if not chosen:
+            return
+
+        source_dir = Path(chosen)
+        if not source_dir.exists() or not source_dir.is_dir():
+            messagebox.showerror("Error", "La carpeta seleccionada no es válida.")
+            return
+
+        folder_name = source_dir.name
+        prefix = "models--Systran--faster-whisper-"
+        if not folder_name.startswith(prefix):
+            messagebox.showerror(
+                "Carpeta inesperada",
+                "La carpeta debe llamarse como models--Systran--faster-whisper-<modelo>.",
+            )
+            return
+
+        has_weights = any(source_dir.rglob("model.bin")) or any(source_dir.rglob("ggml-model.bin"))
+        if not has_weights:
+            messagebox.showerror(
+                "Modelo incompleto",
+                "No se encontraron archivos del modelo (model.bin). Verifica que la descarga esté completa.",
+            )
+            return
+
+        cache_root = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "hf_lumi"))
+        target_root = cache_root / "hub"
+        target_root.mkdir(parents=True, exist_ok=True)
+
+        target_dir = target_root / folder_name
+        try:
+            if target_dir.exists():
+                if not messagebox.askyesno(
+                    "Reemplazar modelo",
+                    "Ya existe un modelo con ese nombre. ¿Deseas reemplazarlo?",
+                    default=messagebox.NO,
+                    icon=messagebox.WARNING,
+                ):
+                    return
+                shutil.rmtree(target_dir)
+
+            shutil.copytree(source_dir, target_dir)
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo copiar el modelo:\n{e}")
+            self._log(f"❌ Falló la copia manual del modelo: {e}")
+            return
+
+        self._log(f"📦 Modelo manual instalado: {folder_name}")
+        messagebox.showinfo(
+            "Instalación completada",
+            "El modelo se copió correctamente. Ya puedes usarlo desde la lista de modelos.",
+        )
 
     def _open_folder(self) -> None:
         """Abre la carpeta del archivo o la carpeta seleccionada."""
