@@ -48,6 +48,80 @@ try:
 except Exception:
     WhisperModel = None  # type: ignore
 
+# --- FFMPEG discovery/forcing (plug-and-play) ---
+FFMPEG_EXE = None  # type: Optional[Path]
+FFPROBE_EXE = None  # type: Optional[Path]
+
+def _candidate_ffmpeg_dirs() -> list[Path]:
+    """Posibles ubicaciones de ffmpeg dentro del build o proyecto."""
+    here = Path(__file__).parent
+    candidates = [here / "ffmpeg" / "bin", here / "ffmpeg"]
+    # Si está empaquetado, usar el directorio del exe
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).parent
+        candidates = [exe_dir / "ffmpeg" / "bin", exe_dir / "ffmpeg"] + candidates
+    # Quitar duplicados preservando orden
+    seen = set()
+    out = []
+    for p in candidates:
+        if str(p) not in seen:
+            seen.add(str(p))
+            out.append(p)
+    return out
+
+def _find_ffmpeg_in(folder: Path) -> tuple[Optional[Path], Optional[Path]]:
+    ff = folder / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+    fp = folder / ("ffprobe.exe" if os.name == "nt" else "ffprobe")
+    return (ff if ff.exists() else None, fp if fp.exists() else None)
+
+def ensure_ffmpeg_available(interactive: bool = True) -> None:
+    """Fuerza la disponibilidad de ffmpeg/ffprobe:
+    - Busca en rutas candidatas del build.
+    - Si no los halla y 'interactive', pide carpeta al usuario.
+    - Prepend la carpeta encontrada al PATH del proceso.
+    - Setea FFMPEG_EXE/FFPROBE_EXE con rutas absolutas.
+    """
+    global FFMPEG_EXE, FFPROBE_EXE
+
+    # 1) Buscar en candidatas
+    for d in _candidate_ffmpeg_dirs():
+        ff, fp = _find_ffmpeg_in(d)
+        if ff and fp:
+            os.environ["PATH"] = str(d) + os.pathsep + os.environ.get("PATH", "")
+            FFMPEG_EXE, FFPROBE_EXE = ff, fp
+            return
+
+    # 2) Si no, pedir carpeta (solo GUI)
+    if interactive:
+        try:
+            from tkinter import filedialog, messagebox
+            messagebox.showinfo(
+                "FFmpeg requerido",
+                "No encontré ffmpeg. Selecciona la carpeta que contiene ffmpeg.exe y ffprobe.exe."
+            )
+            chosen = filedialog.askdirectory(title="Selecciona la carpeta de ffmpeg")
+            if chosen:
+                d = Path(chosen)
+                ff, fp = _find_ffmpeg_in(d)
+                # También probar subcarpeta bin si eligieron la raíz
+                if not (ff and fp) and (d / "bin").exists():
+                    ff, fp = _find_ffmpeg_in(d / "bin")
+                    if ff and fp:
+                        d = d / "bin"
+                if ff and fp:
+                    os.environ["PATH"] = str(d) + os.pathsep + os.environ.get("PATH", "")
+                    FFMPEG_EXE, FFPROBE_EXE = ff, fp
+                    return
+                else:
+                    messagebox.showerror(
+                        "FFmpeg no válido",
+                        "La carpeta seleccionada no contiene ffmpeg.exe y ffprobe.exe."
+                    )
+        except Exception:
+            pass
+
+    # 3) Si seguimos sin encontrarlos, dejar variables en None (check_ffmpeg lo reportará)
+
 # ==========================
 #   Constantes y mapas
 # ==========================
@@ -76,11 +150,21 @@ def which(program: str) -> Optional[str]:
 
 
 def check_ffmpeg() -> tuple[bool, str]:
-    """Comprueba presencia de ffmpeg y ffprobe en PATH."""
+    """Comprueba presencia de ffmpeg/ffprobe. Usa rutas absolutas si las tenemos."""
+    # 1) Priorizar rutas encontradas por ensure_ffmpeg_available()
+    if FFMPEG_EXE and FFPROBE_EXE:
+        try:
+            out = subprocess.check_output([str(FFMPEG_EXE), "-version"], stderr=subprocess.STDOUT)
+            first = out.decode(errors="ignore").splitlines()[0]
+            return True, first
+        except Exception as e:
+            return False, f"No pude ejecutar ffmpeg embebido: {e}"
+
+    # 2) Fallback: PATH del sistema/proceso
     ffmpeg_path = which("ffmpeg")
     ffprobe_path = which("ffprobe")
     if not ffmpeg_path or not ffprobe_path:
-        return False, "FFmpeg/ffprobe no encontrados en PATH."
+        return False, "FFmpeg/ffprobe no encontrados."
     try:
         out = subprocess.check_output(["ffmpeg", "-version"], stderr=subprocess.STDOUT)
         return True, out.decode(errors="ignore").splitlines()[0]
@@ -89,21 +173,18 @@ def check_ffmpeg() -> tuple[bool, str]:
 
 
 def get_duration_seconds(path: Path) -> Optional[float]:
-    """Obtiene duración (segundos) usando ffprobe. None si falla."""
+    """Obtiene duración con ffprobe. Usa ruta absoluta si está disponible."""
     try:
-        cmd = [
-            "ffprobe",
-            "-v",
-            "error",
-            "-print_format",
-            "json",
-            "-show_entries",
-            "format=duration",
+        ffprobe_cmd = [str(FFPROBE_EXE)] if FFPROBE_EXE else ["ffprobe"]
+        cmd = ffprobe_cmd + [
+            "-v", "error",
+            "-print_format", "json",
+            "-show_entries", "format=duration",
             str(path),
         ]
         out = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
         data = json.loads(out.decode("utf-8", errors="ignore"))
-        return float(data["format"]["duration"])  # type: ignore[index]
+        return float(data["format"]["duration"])
     except Exception:
         return None
 
@@ -263,10 +344,13 @@ class App(tk.Tk):
         self.stop_flag = threading.Event()  # reservado por si se añade cancelación real
 
         self._build_widgets()
-        self.after(100, self._drain_log)
+
+        ensure_ffmpeg_available(interactive=True)
 
         ok, msg = check_ffmpeg()
         self._log(f"✅ FFmpeg detectado: {msg}" if ok else f"⚠️ {msg}")
+
+        self.after(100, self._drain_log)
         self._update_start_enabled()
 
     # ---------- Infra de log ----------

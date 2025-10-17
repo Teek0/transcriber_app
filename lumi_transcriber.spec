@@ -1,11 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
-# PyInstaller spec for Lumi Transcriber (Windows, onedir, Tkinter)
-# Bundles ffmpeg/ffprobe, includes app icon, and sets HF cache next to the exe.
-# Project layout expected:
-#   transcriber_app.py
-#   assets\lumi.ico
-#   ffmpeg\bin\ffmpeg.exe
-#   ffmpeg\bin\ffprobe.exe
+# PyInstaller spec for Lumi Transcriber (Windows, onedir)
+# Bundles ffmpeg + icon; tolerates ffmpeg in ffmpeg/ or ffmpeg/bin at runtime.
 
 block_cipher = None
 
@@ -13,8 +8,9 @@ a = Analysis(
     ['transcriber_app.py'],
     pathex=[],
     binaries=[
-        ('ffmpeg\\bin\\ffmpeg.exe', 'ffmpeg'),
-        ('ffmpeg\\bin\\ffprobe.exe', 'ffmpeg'),
+        # Place into ffmpeg/bin in the dist to match upstream layout
+        ('ffmpeg\\bin\\ffmpeg.exe', 'ffmpeg\\bin'),
+        ('ffmpeg\\bin\\ffprobe.exe', 'ffmpeg\\bin'),
     ],
     datas=[
         ('assets\\lumi.ico', 'assets'),
@@ -44,7 +40,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=False,  # GUI app
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
